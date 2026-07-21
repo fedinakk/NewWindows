@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        run: msbuild InfiniteCanvas.sln /m /nologo /p:Configuration=Release /p:Platform=x64
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item bin/x64/Release/InfiniteCanvas.exe dist/
+          Copy-Item config.ini dist/
+          Copy-Item README.md dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfiniteCanvas-x64
+          path: dist/
