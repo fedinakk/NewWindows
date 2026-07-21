@@ -4,7 +4,8 @@
 
 class Config;
 
-// Global low-level mouse hook and the pan gesture state machine.
+// Global low-level mouse hook: the pan gesture state machine plus global
+// capture of Ctrl+Alt+wheel (zoom) and Ctrl+Alt+middle-drag (pan anywhere).
 //
 // The hook runs on the main thread (LL hooks are dispatched through the
 // installing thread's message loop), so no locking is needed, but the
@@ -19,18 +20,25 @@ public:
     bool IsPaused() const { return paused_; }
     bool IsPanning() const { return state_ == State::Panning; }
 
+    // Extra window treated as canvas background (the backdrop layer).
+    void SetExtraBackground(HWND hwnd) { extraBackground_ = hwnd; }
+
     // Cursor position where the gesture started (pan anchor).
     POINT StartPoint() const { return startPt_; }
 
     // Latest cursor position; clears the coalescing flag.
     POINT ConsumeLatest();
 
+    // Accumulated wheel delta (multiples of WHEEL_DELTA) and the cursor
+    // position of the last wheel event; clears the coalescing flag.
+    void ConsumeZoom(int& wheelDelta, POINT& pt);
+
     // Cursor velocity at release, px/s (computed on button-up).
     void ReleaseVelocity(double& vx, double& vy) const;
 
 private:
     enum class State { Idle, Pending, Panning };
-    enum class Button { None, Middle, AltLeft };
+    enum class Button { None, Middle, AltLeft, CtrlAltMiddle };
 
     struct Sample {
         POINT pt;
@@ -40,6 +48,7 @@ private:
     HWND notify_ = nullptr;
     const Config* cfg_ = nullptr;
     HHOOK hook_ = nullptr;
+    HWND extraBackground_ = nullptr;
     bool paused_ = false;
 
     State state_ = State::Idle;
@@ -47,6 +56,10 @@ private:
     POINT startPt_{0, 0};
     POINT latest_{0, 0};
     bool updatePending_ = false;
+
+    int wheelAccum_ = 0;
+    POINT wheelPt_{0, 0};
+    bool zoomPending_ = false;
 
     static const int kMaxSamples = 32;
     Sample samples_[kMaxSamples];
@@ -58,9 +71,11 @@ private:
 
     // Returns true if the event must be swallowed.
     bool Handle(WPARAM message, const MSLLHOOKSTRUCT* info);
-    bool TryStart(POINT pt, Button button);
+    bool TryStart(POINT pt, Button button, bool requireBackground);
     bool Finish(POINT pt);
     bool IsBackgroundAt(POINT pt) const;
     void AddSample(POINT pt);
     void ComputeReleaseVelocity(POINT releasePt);
+
+    static bool CtrlAltDown();
 };

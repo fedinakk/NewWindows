@@ -16,14 +16,33 @@ L";  Кодировка файла: UTF-16 LE (не меняйте её при �
 L"; ============================================================\r\n"
 L"\r\n"
 L"[Pan]\r\n"
-L"; Панорамирование средней кнопкой мыши (зажать на фоне рабочего стола)\r\n"
+L"; Основной жест: Ctrl+Alt + зажатая средняя кнопка — панорамирование\r\n"
+L"; из любого места, поверх любого окна\r\n"
+L"CtrlAltMiddle=true\r\n"
+L"; Дополнительно: средняя кнопка на фоне рабочего стола (без модификаторов)\r\n"
 L"MiddleButton=true\r\n"
-L"; Панорамирование через Alt + левая кнопка мыши\r\n"
+L"; Дополнительно: Alt + левая кнопка на фоне рабочего стола\r\n"
 L"AltLeftButton=true\r\n"
 L"; Чувствительность панорамирования (1.0 = движение 1:1)\r\n"
 L"Sensitivity=1.0\r\n"
 L"; Порог в пикселях: меньше — клик, больше — перетаскивание\r\n"
 L"DragThresholdPx=4\r\n"
+L"\r\n"
+L"[Zoom]\r\n"
+L"; Зум колесом: Ctrl+Alt + прокрутка (геометрический зум раскладки окон)\r\n"
+L"Enabled=true\r\n"
+L"; Глобально поглощать Ctrl+Alt+колесо, не отдавая его активному приложению\r\n"
+L"CaptureWheel=true\r\n"
+L"; Множитель масштаба на один щелчок колеса\r\n"
+L"Step=1.1\r\n"
+L"; Пределы масштаба\r\n"
+L"Min=0.25\r\n"
+L"Max=2.5\r\n"
+L"\r\n"
+L"[Render]\r\n"
+L"; Целевая частота цикла анимации (инерция, перелёты), кадров/сек. 30..240.\r\n"
+L"; Реальная перерисовка чужих окон ограничена DWM — см. README.\r\n"
+L"TargetFPS=240\r\n"
 L"\r\n"
 L"[Inertia]\r\n"
 L"; Инерция холста после отпускания кнопки\r\n"
@@ -57,16 +76,30 @@ L"Enabled=true\r\n"
 L"; Непрозрачность оверлея, 0-255\r\n"
 L"Alpha=235\r\n"
 L"\r\n"
+L"[Backdrop]\r\n"
+L"; Подложка-полотно за всеми окнами (панорамируется и зумится с камерой)\r\n"
+L"Enabled=true\r\n"
+L"; Цвет полотна, RRGGBB (hex)\r\n"
+L"Color=14161C\r\n"
+L"; Точечная сетка на полотне\r\n"
+L"ShowGrid=true\r\n"
+L"; Цвет сетки, RRGGBB (hex)\r\n"
+L"GridColor=2A2E3A\r\n"
+L"; Шаг сетки в виртуальных пикселях\r\n"
+L"GridStep=96\r\n"
+L"\r\n"
 L"[Hotkeys]\r\n"
 L"; Закладки камеры: Ctrl+Alt+1..4 — перейти, Ctrl+Alt+Shift+1..4 — сохранить\r\n"
 L"EnableBookmarks=true\r\n"
 L"\r\n"
 L"[Debug]\r\n"
+L"; Показывать оверлей FPS при запуске (переключается Ctrl+Alt+F)\r\n"
+L"ShowFps=false\r\n"
 L"; Писать лог в infinitecanvas.log рядом с exe\r\n"
 L"LogToFile=false\r\n"
 L"\r\n"
 L"[Bookmarks]\r\n"
-L"; Заполняется автоматически (Ctrl+Alt+Shift+1..4)\r\n";
+L"; Заполняется автоматически (Ctrl+Alt+Shift+1..4): x,y,масштаб\r\n";
 
 std::wstring Trim(const std::wstring& s)
 {
@@ -85,6 +118,7 @@ void Config::Load()
     path_ = ExeDir() + L"\\config.ini";
     EnsureFileExists();
 
+    ctrlAltMiddle = ReadBool(L"Pan", L"CtrlAltMiddle", true);
     middleButton = ReadBool(L"Pan", L"MiddleButton", true);
     altLeftButton = ReadBool(L"Pan", L"AltLeftButton", true);
     sensitivity = ReadDouble(L"Pan", L"Sensitivity", 1.0);
@@ -93,6 +127,28 @@ void Config::Load()
     dragThresholdPx = ReadInt(L"Pan", L"DragThresholdPx", 4);
     if (dragThresholdPx < 0 || dragThresholdPx > 100)
         dragThresholdPx = 4;
+
+    zoomEnabled = ReadBool(L"Zoom", L"Enabled", true);
+    captureWheel = ReadBool(L"Zoom", L"CaptureWheel", true);
+    zoomStep = ReadDouble(L"Zoom", L"Step", 1.1);
+    if (zoomStep < 1.01 || zoomStep > 2.0)
+        zoomStep = 1.1;
+    zoomMin = ReadDouble(L"Zoom", L"Min", 0.25);
+    zoomMax = ReadDouble(L"Zoom", L"Max", 2.5);
+    if (zoomMin < 0.05)
+        zoomMin = 0.05;
+    if (zoomMax > 8.0)
+        zoomMax = 8.0;
+    if (zoomMin > 1.0)
+        zoomMin = 1.0;
+    if (zoomMax < 1.0)
+        zoomMax = 1.0;
+
+    targetFps = ReadInt(L"Render", L"TargetFPS", 240);
+    if (targetFps < 30)
+        targetFps = 30;
+    if (targetFps > 240)
+        targetFps = 240;
 
     inertiaEnabled = ReadBool(L"Inertia", L"Enabled", true);
     inertiaFriction = ReadDouble(L"Inertia", L"Friction", 5.0);
@@ -118,17 +174,29 @@ void Config::Load()
     if (overviewAlpha < 30 || overviewAlpha > 255)
         overviewAlpha = 235;
 
+    backdropEnabled = ReadBool(L"Backdrop", L"Enabled", true);
+    backdropColor = ReadColor(L"Backdrop", L"Color", RGB(0x14, 0x16, 0x1C));
+    backdropShowGrid = ReadBool(L"Backdrop", L"ShowGrid", true);
+    backdropGridColor = ReadColor(L"Backdrop", L"GridColor", RGB(0x2A, 0x2E, 0x3A));
+    backdropGridStep = ReadInt(L"Backdrop", L"GridStep", 96);
+    if (backdropGridStep < 16 || backdropGridStep > 1024)
+        backdropGridStep = 96;
+
     enableBookmarks = ReadBool(L"Hotkeys", L"EnableBookmarks", true);
+    showFps = ReadBool(L"Debug", L"ShowFps", false);
     logToFile = ReadBool(L"Debug", L"LogToFile", false);
 
     for (int i = 0; i < 4; ++i) {
         wchar_t key[16];
         _snwprintf_s(key, _TRUNCATE, L"Slot%d", i + 1);
         std::wstring value = ReadString(L"Bookmarks", key, L"");
-        long x = 0, y = 0;
-        if (swscanf_s(value.c_str(), L"%ld , %ld", &x, &y) == 2) {
+        double x = 0, y = 0, scale = 1.0;
+        int parsed = swscanf_s(value.c_str(), L"%lf , %lf , %lf", &x, &y, &scale);
+        if (parsed >= 2) {
             bookmarks[i].set = true;
-            bookmarks[i].cam = POINT{x, y};
+            bookmarks[i].cam.x = x;
+            bookmarks[i].cam.y = y;
+            bookmarks[i].cam.scale = (parsed == 3 && scale > 0.01 && scale < 100.0) ? scale : 1.0;
         } else {
             bookmarks[i].set = false;
         }
@@ -139,9 +207,10 @@ void Config::SaveBookmark(int index)
 {
     if (index < 0 || index >= 4 || !bookmarks[index].set)
         return;
-    wchar_t key[16], value[64];
+    wchar_t key[16], value[96];
     _snwprintf_s(key, _TRUNCATE, L"Slot%d", index + 1);
-    _snwprintf_s(value, _TRUNCATE, L"%ld,%ld", bookmarks[index].cam.x, bookmarks[index].cam.y);
+    _snwprintf_s(value, _TRUNCATE, L"%.2f,%.2f,%.4f",
+                 bookmarks[index].cam.x, bookmarks[index].cam.y, bookmarks[index].cam.scale);
     WritePrivateProfileStringW(L"Bookmarks", key, value, path_.c_str());
 }
 
@@ -196,6 +265,20 @@ double Config::ReadDouble(const wchar_t* section, const wchar_t* key, double def
     if (v.empty())
         return def;
     return _wtof(v.c_str());
+}
+
+COLORREF Config::ReadColor(const wchar_t* section, const wchar_t* key, COLORREF def) const
+{
+    std::wstring v = ReadString(section, key, L"");
+    if (v.empty())
+        return def;
+    if (v[0] == L'#')
+        v.erase(0, 1);
+    wchar_t* end = nullptr;
+    unsigned long rgb = wcstoul(v.c_str(), &end, 16);
+    if (end == v.c_str() || rgb > 0xFFFFFF)
+        return def;
+    return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
 std::vector<std::wstring> Config::ReadList(const wchar_t* section, const wchar_t* key, const wchar_t* def) const

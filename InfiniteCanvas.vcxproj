@@ -48,7 +48,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>user32.lib;gdi32.lib;shell32.lib;dwmapi.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;shell32.lib;dwmapi.lib;advapi32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <AdditionalManifestFiles>app.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
@@ -76,8 +76,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\App.cpp" />
+    <ClCompile Include="src\CanvasBackdrop.cpp" />
     <ClCompile Include="src\Common.cpp" />
     <ClCompile Include="src\Config.cpp" />
+    <ClCompile Include="src\FpsOverlay.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\OverviewWindow.cpp" />
     <ClCompile Include="src\PanController.cpp" />
@@ -86,8 +88,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\App.h" />
+    <ClInclude Include="src\CanvasBackdrop.h" />
     <ClInclude Include="src\Common.h" />
     <ClInclude Include="src\Config.h" />
+    <ClInclude Include="src\FpsOverlay.h" />
     <ClInclude Include="src\OverviewWindow.h" />
     <ClInclude Include="src\PanController.h" />
     <ClInclude Include="src\TrayIcon.h" />

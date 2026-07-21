@@ -4,13 +4,15 @@
 
 #include <dwmapi.h>
 
+#include <algorithm>
+
 #ifndef DWMWA_CLOAKED
 #define DWMWA_CLOAKED 14
 #endif
 
 namespace {
 
-const UINT kSwpFlags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+const UINT kSwpBaseFlags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
 
 // Shell and system windows that must never be moved, regardless of config.
 const wchar_t* kSystemBlacklist[] = {
@@ -80,6 +82,7 @@ void WindowTracker::Init(const Config* cfg, DWORD ownPid)
     cfg_ = cfg;
     ownPid_ = ownPid;
     ownIntegrity_ = ProcessIntegrityLevel(GetCurrentProcess());
+    systemMinTrack_ = SIZE{GetSystemMetrics(SM_CXMINTRACK), GetSystemMetrics(SM_CYMINTRACK)};
 }
 
 struct EnumContext {
@@ -98,7 +101,26 @@ BOOL CALLBACK WindowTracker::EnumProc(HWND hwnd, LPARAM lparam)
     return TRUE;
 }
 
-void WindowTracker::Refresh(POINT camera)
+bool WindowTracker::IsResizableWindow(HWND hwnd)
+{
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    return (style & WS_THICKFRAME) != 0 && !IsZoomed(hwnd);
+}
+
+// Adopt a window at its current screen rect: the virtual rect is whatever
+// currently maps onto that screen rect under the current camera. A window
+// opened while zoomed out keeps its apparent size (no visual snap), which
+// means its canvas size differs from its natural size - documented in README.
+void WindowTracker::AdoptRect(TrackedWindow& entry, const RECT& rect, const Camera& camera) const
+{
+    ScreenToVirtual(camera, POINT{rect.left, rect.top}, entry.vx, entry.vy);
+    entry.vw = (rect.right - rect.left) / camera.scale;
+    entry.vh = (rect.bottom - rect.top) / camera.scale;
+    entry.appliedPos = POINT{rect.left, rect.top};
+    entry.appliedSize = SIZE{rect.right - rect.left, rect.bottom - rect.top};
+}
+
+void WindowTracker::Refresh(const Camera& camera)
 {
     std::vector<TrackedWindow> next;
     next.reserve(64);
@@ -111,23 +133,73 @@ void WindowTracker::Refresh(POINT camera)
         RECT rect{};
         if (!GetWindowRect(entry.hwnd, &rect))
             continue; // window died between EnumWindows and now
-        entry.size = SIZE{rect.right - rect.left, rect.bottom - rect.top};
-        entry.applied = POINT{rect.left, rect.top};
-        entry.virt = POINT{rect.left + camera.x, rect.top + camera.y};
 
         wchar_t title[256] = L"";
         GetWindowTextW(entry.hwnd, title, 256);
         entry.title = title;
+        entry.resizable = IsResizableWindow(entry.hwnd);
 
         const TrackedWindow* old = Find(entry.hwnd);
-        entry.movable = old ? old->movable : ProbeMovable(entry.hwnd);
+        if (!old) {
+            entry.movable = ProbeMovable(entry.hwnd);
+            entry.minSize = systemMinTrack_;
+            AdoptRect(entry, rect, camera);
+            ready.push_back(std::move(entry));
+            continue;
+        }
+
+        entry.movable = old->movable;
+        entry.minSize = old->minSize;
+        entry.vx = old->vx;
+        entry.vy = old->vy;
+        entry.vw = old->vw;
+        entry.vh = old->vh;
+        entry.appliedPos = old->appliedPos;
+        entry.appliedSize = old->appliedSize;
+
+        const SIZE actual{rect.right - rect.left, rect.bottom - rect.top};
+
+        // Position: absorb only external moves; if the rect matches what we
+        // last applied, keep the fractional virtual position (re-quantizing
+        // it through integer screen coords every refresh would drift).
+        if (rect.left != entry.appliedPos.x || rect.top != entry.appliedPos.y) {
+            ScreenToVirtual(camera, POINT{rect.left, rect.top}, entry.vx, entry.vy);
+            entry.appliedPos = POINT{rect.left, rect.top};
+        }
+
+        if (!entry.resizable) {
+            // We never request sizes for these; their canvas footprint is
+            // simply their current screen size seen through the camera.
+            entry.vw = actual.cx / camera.scale;
+            entry.vh = actual.cy / camera.scale;
+            entry.appliedSize = actual;
+        } else if (actual.cx != entry.appliedSize.cx || actual.cy != entry.appliedSize.cy) {
+            // Per dimension: bigger than requested means the window refused
+            // to shrink (its own min size) - learn the floor, keep the
+            // virtual size pristine so zooming back restores it. Smaller
+            // means an external resize - absorb it and forget the floor.
+            if (actual.cx > entry.appliedSize.cx) {
+                entry.minSize.cx = std::max(entry.minSize.cx, actual.cx);
+            } else {
+                entry.vw = actual.cx / camera.scale;
+                entry.minSize.cx = systemMinTrack_.cx;
+            }
+            if (actual.cy > entry.appliedSize.cy) {
+                entry.minSize.cy = std::max(entry.minSize.cy, actual.cy);
+            } else {
+                entry.vh = actual.cy / camera.scale;
+                entry.minSize.cy = systemMinTrack_.cy;
+            }
+            entry.appliedSize = actual;
+        }
+
         ready.push_back(std::move(entry));
     }
 
     windows_ = std::move(ready);
 }
 
-bool WindowTracker::ResyncWindow(HWND hwnd, POINT camera)
+bool WindowTracker::ResyncWindow(HWND hwnd, const Camera& camera)
 {
     for (auto& entry : windows_) {
         if (entry.hwnd != hwnd)
@@ -135,9 +207,10 @@ bool WindowTracker::ResyncWindow(HWND hwnd, POINT camera)
         RECT rect{};
         if (!GetWindowRect(hwnd, &rect))
             return false;
-        entry.size = SIZE{rect.right - rect.left, rect.bottom - rect.top};
-        entry.applied = POINT{rect.left, rect.top};
-        entry.virt = POINT{rect.left + camera.x, rect.top + camera.y};
+        // The user moved/resized it deliberately: their rect is the truth.
+        entry.resizable = IsResizableWindow(hwnd);
+        entry.minSize = systemMinTrack_;
+        AdoptRect(entry, rect, camera);
         return true;
     }
     return false;
@@ -151,11 +224,13 @@ const TrackedWindow* WindowTracker::Find(HWND hwnd) const
     return nullptr;
 }
 
-void WindowTracker::ApplyCamera(POINT camera)
+void WindowTracker::ApplyCamera(const Camera& camera)
 {
     struct Move {
         size_t index;
-        POINT to;
+        POINT pos;
+        SIZE size;
+        bool resize;
     };
     std::vector<Move> moves;
     moves.reserve(windows_.size());
@@ -169,10 +244,22 @@ void WindowTracker::ApplyCamera(POINT camera)
         // A hung window would stall the whole batch inside EndDeferWindowPos.
         if (IsHungAppWindow(entry.hwnd))
             continue;
-        POINT to{entry.virt.x - camera.x, entry.virt.y - camera.y};
-        if (to.x == entry.applied.x && to.y == entry.applied.y)
-            continue;
-        moves.push_back({i, to});
+
+        POINT pos = VirtualToScreen(camera, entry.vx, entry.vy);
+        // A window can become maximized between refreshes; never resize those.
+        bool resize = entry.resizable && !IsZoomed(entry.hwnd);
+        SIZE size = entry.appliedSize;
+        if (resize) {
+            size.cx = std::max((LONG)std::lround(entry.vw * camera.scale), entry.minSize.cx);
+            size.cy = std::max((LONG)std::lround(entry.vh * camera.scale), entry.minSize.cy);
+        }
+
+        bool posChanged = pos.x != entry.appliedPos.x || pos.y != entry.appliedPos.y;
+        bool sizeChanged = resize && (size.cx != entry.appliedSize.cx || size.cy != entry.appliedSize.cy);
+        if (!posChanged && !sizeChanged)
+            continue; // never issue no-op DeferWindowPos calls
+
+        moves.push_back({i, pos, size, sizeChanged});
     }
 
     if (moves.empty())
@@ -182,8 +269,9 @@ void WindowTracker::ApplyCamera(POINT camera)
     bool ok = hdwp != nullptr;
     if (ok) {
         for (const auto& move : moves) {
+            UINT flags = kSwpBaseFlags | (move.resize ? 0 : SWP_NOSIZE);
             hdwp = DeferWindowPos(hdwp, windows_[move.index].hwnd, nullptr,
-                                  move.to.x, move.to.y, 0, 0, kSwpFlags);
+                                  move.pos.x, move.pos.y, move.size.cx, move.size.cy, flags);
             if (!hdwp) {
                 ok = false;
                 break;
@@ -194,8 +282,11 @@ void WindowTracker::ApplyCamera(POINT camera)
         ok = !!EndDeferWindowPos(hdwp);
 
     if (ok) {
-        for (const auto& move : moves)
-            windows_[move.index].applied = move.to;
+        for (const auto& move : moves) {
+            windows_[move.index].appliedPos = move.pos;
+            if (move.resize)
+                windows_[move.index].appliedSize = move.size;
+        }
         return;
     }
 
@@ -203,9 +294,13 @@ void WindowTracker::ApplyCamera(POINT camera)
     // and remember which windows we are not allowed to touch.
     for (const auto& move : moves) {
         auto& entry = windows_[move.index];
+        UINT flags = kSwpBaseFlags | (move.resize ? 0 : SWP_NOSIZE);
         SetLastError(0);
-        if (SetWindowPos(entry.hwnd, nullptr, move.to.x, move.to.y, 0, 0, kSwpFlags)) {
-            entry.applied = move.to;
+        if (SetWindowPos(entry.hwnd, nullptr, move.pos.x, move.pos.y,
+                         move.size.cx, move.size.cy, flags)) {
+            entry.appliedPos = move.pos;
+            if (move.resize)
+                entry.appliedSize = move.size;
         } else if (GetLastError() == ERROR_ACCESS_DENIED) {
             entry.movable = false;
             elevatedSeen_ = true;

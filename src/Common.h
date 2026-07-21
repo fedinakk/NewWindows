@@ -9,6 +9,8 @@
 #endif
 
 #include <windows.h>
+
+#include <cmath>
 #include <string>
 
 #ifdef _MSC_VER
@@ -17,7 +19,34 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "winmm.lib")
 #endif
+
+// The camera: offset + scale. All coordinate conversions in the app go
+// through these two helpers so offset and scale can never get out of sync.
+//   screen = (virtual - offset) * scale
+//   virtual = screen / scale + offset
+// Coordinates are physical pixels (the process is per-monitor DPI aware),
+// so no DPI factor may ever appear in this transform.
+struct Camera {
+    double x = 0.0; // virtual coordinate shown at screen (0,0)
+    double y = 0.0;
+    double scale = 1.0;
+
+    bool operator==(const Camera& o) const { return x == o.x && y == o.y && scale == o.scale; }
+    bool operator!=(const Camera& o) const { return !(*this == o); }
+};
+
+inline POINT VirtualToScreen(const Camera& c, double vx, double vy)
+{
+    return POINT{(LONG)std::lround((vx - c.x) * c.scale), (LONG)std::lround((vy - c.y) * c.scale)};
+}
+
+inline void ScreenToVirtual(const Camera& c, POINT s, double& vx, double& vy)
+{
+    vx = s.x / c.scale + c.x;
+    vy = s.y / c.scale + c.y;
+}
 
 // Application-private window messages (all delivered to the hidden main window).
 enum : UINT {
@@ -27,11 +56,13 @@ enum : UINT {
     WM_APP_TRAY         = WM_APP + 4, // tray icon callback
     WM_APP_DIRTY        = WM_APP + 5, // window list may have changed (coalesced)
     WM_APP_MOVESIZEEND  = WM_APP + 6, // user finished moving a window; lParam = HWND
+    WM_APP_ZOOM         = WM_APP + 7, // coalesced Ctrl+Alt+wheel zoom steps
 };
 
-// Timers on the main window.
+// Timers on the main window. Animation frames do NOT use SetTimer (its
+// ~15.6 ms floor caps motion at ~66 Hz); they run off a high-resolution
+// waitable timer in the message loop instead.
 enum : UINT_PTR {
-    IDT_TICK      = 1, // 15 ms: inertia / camera flight animation
     IDT_HOUSEKEEP = 2, // 2 s: refresh window list while idle
 };
 
@@ -41,6 +72,7 @@ enum : int {
     HK_OVERVIEW    = 2,
     HK_PAUSE       = 3,
     HK_EXIT        = 4,
+    HK_FPS         = 5,
     HK_BM_GO_FIRST = 10, // 10..13 -> Ctrl+Alt+1..4
     HK_BM_SET_FIRST = 20, // 20..23 -> Ctrl+Alt+Shift+1..4
 };

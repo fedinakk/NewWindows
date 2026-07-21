@@ -21,7 +21,7 @@ public:
     using PickFn = std::function<void(HWND)>;
 
     void Show(HINSTANCE instance, std::vector<OverviewItem> items, RECT viewportVirt,
-              int alpha, PickFn onPick);
+              int alpha, double cameraScale, PickFn onPick);
     void Hide();
     bool IsVisible() const;
     void Destroy();
@@ -32,6 +32,7 @@ private:
     RECT viewport_{0, 0, 0, 0};
     PickFn pick_;
     int hover_ = -1;
+    double cameraScale_ = 1.0;
 
     // World (canvas) -> overlay client mapping.
     double scale_ = 1.0;

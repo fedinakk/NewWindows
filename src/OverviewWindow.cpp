@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace {
 
@@ -54,7 +55,7 @@ void OverviewWindow::EnsureCreated(HINSTANCE instance)
 }
 
 void OverviewWindow::Show(HINSTANCE instance, std::vector<OverviewItem> items,
-                          RECT viewportVirt, int alpha, PickFn onPick)
+                          RECT viewportVirt, int alpha, double cameraScale, PickFn onPick)
 {
     EnsureCreated(instance);
     if (!hwnd_)
@@ -63,6 +64,7 @@ void OverviewWindow::Show(HINSTANCE instance, std::vector<OverviewItem> items,
     items_ = std::move(items);
     viewport_ = viewportVirt;
     pick_ = std::move(onPick);
+    cameraScale_ = cameraScale;
     hover_ = -1;
 
     POINT cursor{};
@@ -208,7 +210,9 @@ void OverviewWindow::Paint(HDC dc, const RECT& client)
     SetTextColor(dc, kTextColor);
     RECT header = client;
     InflateRect(&header, -MulDiv(20, dpi, 96), -MulDiv(14, dpi, 96));
-    DrawTextW(dc, L"Обзор холста", -1, &header, DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX);
+    wchar_t title[64];
+    _snwprintf_s(title, _TRUNCATE, L"Обзор холста · масштаб %.0f%%", cameraScale_ * 100.0);
+    DrawTextW(dc, title, -1, &header, DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX);
     SetTextColor(dc, kDimTextColor);
     DrawTextW(dc, L"ЛКМ — перейти к окну   ·   Esc / ПКМ — закрыть", -1, &header,
               DT_SINGLELINE | DT_LEFT | DT_BOTTOM | DT_NOPREFIX);

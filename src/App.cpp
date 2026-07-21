@@ -1,7 +1,13 @@
 #include "App.h"
 
+#include <timeapi.h>
+
 #include <algorithm>
 #include <cmath>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 namespace {
 
@@ -28,6 +34,10 @@ int App::Run(HINSTANCE instance)
     LogInit(ExeDir() + L"\\infinitecanvas.log", cfg_.logToFile);
     Log(L"Starting");
 
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    qpcFreq_ = freq.QuadPart;
+
     tracker_.Init(&cfg_, GetCurrentProcessId());
 
     WNDCLASSW wc{};
@@ -44,24 +54,63 @@ int App::Run(HINSTANCE instance)
     }
 
     Setup();
-
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+    MessageLoop();
 
     s_app = nullptr;
-    return (int)msg.wParam;
+    return 0;
+}
+
+// Message pump + high-resolution frame timer in one loop. SetTimer cannot go
+// below ~15.6 ms (~66 Hz), so animation frames are driven by a waitable
+// timer the loop waits on alongside the input queue.
+void App::MessageLoop()
+{
+    for (;;) {
+        DWORD handleCount = (frameTimer_ && frameTimerArmed_) ? 1 : 0;
+        DWORD wait = MsgWaitForMultipleObjectsEx(handleCount, &frameTimer_, INFINITE,
+                                                 QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (handleCount && wait == WAIT_OBJECT_0) {
+            OnFrame();
+            if (frameTimerArmed_)
+                ArmFrameTimer();
+        }
+
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT)
+                return;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
 }
 
 void App::Setup()
 {
+    // 1 ms system timer resolution for the whole session; paired with
+    // timeEndPeriod in Teardown.
+    if (timeBeginPeriod(1) == TIMERR_NOERROR)
+        timePeriodRaised_ = true;
+
+    frameTimer_ = CreateWaitableTimerExW(nullptr, nullptr,
+                                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!frameTimer_) // pre-1803 Windows 10: plain waitable timer
+        frameTimer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    framePeriod100ns_ = 10000000ll / std::max(30, std::min(240, cfg_.targetFps));
+
     pan_.Init(hwnd_, &cfg_);
     tray_.Create(hwnd_, WM_APP_TRAY, kTooltip);
     RegisterHotkeys();
     InstallWinEventHooks();
     SetTimer(hwnd_, IDT_HOUSEKEEP, 2000, nullptr);
+
+    fps_.Init(instance_, [this]() { return CurrentStats(); });
+    if (cfg_.showFps)
+        fps_.Show();
+
+    backdrop_.Create(instance_, &cfg_);
+    pan_.SetExtraBackground(backdrop_.Handle());
+    backdrop_.OnCameraChanged(cam_);
 
     // Adopt the initial layout: current screen positions become the canvas
     // origin, so Ctrl+Alt+Home always returns to this arrangement.
@@ -71,22 +120,32 @@ void App::Setup()
 void App::Teardown()
 {
     KillTimer(hwnd_, IDT_HOUSEKEEP);
-    StopTickTimer();
+    StopFrameTimer();
+    if (frameTimer_) {
+        CloseHandle(frameTimer_);
+        frameTimer_ = nullptr;
+    }
     for (auto& hook : eventHooks_) {
         if (hook) {
             UnhookWinEvent(hook);
             hook = nullptr;
         }
     }
-    for (int id : {HK_HOME, HK_OVERVIEW, HK_PAUSE, HK_EXIT})
+    for (int id : {HK_HOME, HK_OVERVIEW, HK_PAUSE, HK_EXIT, HK_FPS})
         UnregisterHotKey(hwnd_, id);
     for (int i = 0; i < 4; ++i) {
         UnregisterHotKey(hwnd_, HK_BM_GO_FIRST + i);
         UnregisterHotKey(hwnd_, HK_BM_SET_FIRST + i);
     }
+    backdrop_.Destroy();
+    fps_.Destroy();
     overview_.Destroy();
     tray_.Destroy();
     pan_.Shutdown();
+    if (timePeriodRaised_) {
+        timeEndPeriod(1);
+        timePeriodRaised_ = false;
+    }
     Log(L"Stopped");
 }
 
@@ -103,6 +162,7 @@ void App::RegisterHotkeys()
         {HK_HOME, base, VK_HOME, L"Ctrl+Alt+Home"},
         {HK_OVERVIEW, base, 'O', L"Ctrl+Alt+O"},
         {HK_PAUSE, base, 'P', L"Ctrl+Alt+P"},
+        {HK_FPS, base, 'F', L"Ctrl+Alt+F"},
         {HK_EXIT, base | MOD_SHIFT, 'Q', L"Ctrl+Alt+Shift+Q"},
     };
     if (cfg_.enableBookmarks) {
@@ -168,12 +228,16 @@ LRESULT App::Handle(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     case WM_APP_PAN_END:
         OnPanEnd();
         return 0;
+    case WM_APP_ZOOM:
+        OnZoom();
+        return 0;
 
     case WM_APP_DIRTY:
         dirtyPosted_ = false;
         dirty_ = true;
-        // During a pan, adopt new windows right away (rate-limited) so they
-        // join the canvas instead of being left behind.
+        // During a pan, adopt new windows right away so they join the canvas
+        // instead of being left behind. The 200 ms limit throttles only this
+        // re-enumeration - the movement itself is applied per mouse event.
         if (mode_ == CamMode::Panning && GetTickCount64() - lastPanRefresh_ > 200) {
             lastPanRefresh_ = GetTickCount64();
             RefreshTracker();
@@ -181,7 +245,7 @@ LRESULT App::Handle(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         return 0;
 
     case WM_APP_MOVESIZEEND:
-        if (!tracker_.ResyncWindow((HWND)lparam, camera_))
+        if (!tracker_.ResyncWindow((HWND)lparam, cam_))
             dirty_ = true; // unknown window: pick it up on the next refresh
         return 0;
 
@@ -190,14 +254,16 @@ LRESULT App::Handle(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         return 0;
 
     case WM_TIMER:
-        if (wparam == IDT_TICK)
-            OnTick();
-        else if (wparam == IDT_HOUSEKEEP)
+        if (wparam == IDT_HOUSEKEEP)
             OnHousekeep();
         return 0;
 
     case WM_APP_TRAY:
         OnTrayMessage(lparam);
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        backdrop_.Refit();
         return 0;
 
     case WM_QUERYENDSESSION:
@@ -220,11 +286,11 @@ LRESULT App::Handle(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 void App::OnPanBegin()
 {
     overview_.Hide();
-    StopTickTimer();
+    StopFrameTimer();
     mode_ = CamMode::Panning;
     lastPanRefresh_ = GetTickCount64();
     RefreshTracker(); // authoritative re-sync right before the gesture
-    panStartCamera_ = camera_;
+    panStartCam_ = cam_;
     panStartCursor_ = pan_.StartPoint();
 }
 
@@ -233,11 +299,12 @@ void App::OnPanUpdate()
     POINT cursor = pan_.ConsumeLatest();
     if (mode_ != CamMode::Panning)
         return;
-    const double s = cfg_.sensitivity;
-    POINT cam{
-        panStartCamera_.x - (LONG)std::lround((cursor.x - panStartCursor_.x) * s),
-        panStartCamera_.y - (LONG)std::lround((cursor.y - panStartCursor_.y) * s),
-    };
+    // Screen-space cursor delta converted to virtual units via the scale
+    // captured at the anchor (re-anchored if the user zooms mid-pan).
+    const double k = cfg_.sensitivity / panStartCam_.scale;
+    Camera cam = panStartCam_;
+    cam.x = panStartCam_.x - (cursor.x - panStartCursor_.x) * k;
+    cam.y = panStartCam_.y - (cursor.y - panStartCursor_.y) * k;
     SetCamera(cam);
 }
 
@@ -250,60 +317,134 @@ void App::OnPanEnd()
     double vx = 0, vy = 0;
     pan_.ReleaseVelocity(vx, vy);
     const double speed = std::hypot(vx, vy);
-    if (!cfg_.inertiaEnabled || speed < cfg_.inertiaMinVelocity)
+    if (!cfg_.inertiaEnabled || !frameTimer_ || speed < cfg_.inertiaMinVelocity)
         return;
 
     mode_ = CamMode::Inertia;
-    velX_ = -vx * cfg_.sensitivity;
-    velY_ = -vy * cfg_.sensitivity;
-    inertiaX_ = camera_.x;
-    inertiaY_ = camera_.y;
-    lastTick_ = GetTickCount64();
-    StartTickTimer();
+    // Cursor velocity is screen px/s; camera coasts in virtual units.
+    velX_ = -vx * cfg_.sensitivity / cam_.scale;
+    velY_ = -vy * cfg_.sensitivity / cam_.scale;
+    lastAnimQpc_ = NowQpc();
+    StartFrameTimer();
 }
 
-void App::OnTick()
+// ------------------------------------------------------------------- zoom --
+
+void App::OnZoom()
 {
-    const ULONGLONG now = GetTickCount64();
+    int wheelDelta = 0;
+    POINT anchor{};
+    pan_.ConsumeZoom(wheelDelta, anchor);
+    if (!cfg_.zoomEnabled || wheelDelta == 0)
+        return;
+    if (overview_.IsVisible())
+        return;
+
+    const double oldScale = cam_.scale;
+    const double steps = (double)wheelDelta / WHEEL_DELTA;
+    double newScale = oldScale * std::pow(cfg_.zoomStep, steps);
+    newScale = std::max(cfg_.zoomMin, std::min(cfg_.zoomMax, newScale));
+    if (newScale == oldScale)
+        return;
+
+    // Zoom to the cursor: the virtual point under it must stay under it.
+    double vx = 0, vy = 0;
+    ScreenToVirtual(cam_, anchor, vx, vy);
+    Camera cam;
+    cam.scale = newScale;
+    cam.x = vx - anchor.x / newScale;
+    cam.y = vy - anchor.y / newScale;
+
+    if (mode_ == CamMode::Flying) {
+        StopFrameTimer();
+        mode_ = CamMode::Idle;
+    }
+    SetCamera(cam);
+
+    if (mode_ == CamMode::Panning) {
+        // Re-anchor the active pan so the gesture continues seamlessly.
+        panStartCam_ = cam_;
+        panStartCursor_ = anchor;
+    } else if (mode_ == CamMode::Inertia) {
+        // Keep the on-screen coasting speed constant across the zoom.
+        velX_ *= oldScale / newScale;
+        velY_ *= oldScale / newScale;
+    }
+}
+
+// ------------------------------------------------------------ frame timer --
+
+void App::OnFrame()
+{
+    const long long now = NowQpc();
 
     if (mode_ == CamMode::Inertia) {
-        double dt = (double)(now - lastTick_) / 1000.0;
-        lastTick_ = now;
+        double dt = (double)(now - lastAnimQpc_) / qpcFreq_;
+        lastAnimQpc_ = now;
         if (dt <= 0)
             return;
-        dt = std::min(dt, 0.1); // a stalled timer must not teleport the canvas
+        dt = std::min(dt, 0.1); // a stalled loop must not teleport the canvas
 
-        inertiaX_ += velX_ * dt;
-        inertiaY_ += velY_ * dt;
+        Camera cam = cam_;
+        cam.x += velX_ * dt;
+        cam.y += velY_ * dt;
         const double decay = std::exp(-cfg_.inertiaFriction * dt);
         velX_ *= decay;
         velY_ *= decay;
+        SetCamera(cam);
 
-        SetCamera(POINT{(LONG)std::lround(inertiaX_), (LONG)std::lround(inertiaY_)});
-
-        if (std::hypot(velX_, velY_) < 60.0) {
+        // Stop when the on-screen speed becomes imperceptible.
+        if (std::hypot(velX_, velY_) * cam_.scale < 60.0) {
             mode_ = CamMode::Idle;
-            StopTickTimer();
+            StopFrameTimer();
         }
         return;
     }
 
     if (mode_ == CamMode::Flying) {
-        double t = flyDuration_ > 0 ? (double)(now - flyStart_) / flyDuration_ : 1.0;
+        double t = flyDuration_ > 0 ? SecondsSince(flyStartQpc_) * 1000.0 / flyDuration_ : 1.0;
         t = std::min(1.0, std::max(0.0, t));
         const double e = EaseOutCubic(t);
-        SetCamera(POINT{
-            flyFrom_.x + (LONG)std::lround((flyTo_.x - flyFrom_.x) * e),
-            flyFrom_.y + (LONG)std::lround((flyTo_.y - flyFrom_.y) * e),
-        });
+        Camera cam;
+        cam.x = flyFrom_.x + (flyTo_.x - flyFrom_.x) * e;
+        cam.y = flyFrom_.y + (flyTo_.y - flyFrom_.y) * e;
+        cam.scale = flyFrom_.scale + (flyTo_.scale - flyFrom_.scale) * e;
+        SetCamera(cam);
         if (t >= 1.0) {
+            SetCamera(flyTo_);
             mode_ = CamMode::Idle;
-            StopTickTimer();
+            StopFrameTimer();
         }
         return;
     }
 
-    StopTickTimer();
+    StopFrameTimer();
+}
+
+void App::StartFrameTimer()
+{
+    if (!frameTimer_)
+        return;
+    if (!frameTimerArmed_) {
+        frameTimerArmed_ = true;
+        ArmFrameTimer();
+    }
+}
+
+void App::ArmFrameTimer()
+{
+    LARGE_INTEGER due;
+    due.QuadPart = -framePeriod100ns_;
+    SetWaitableTimer(frameTimer_, &due, 0, nullptr, nullptr, FALSE);
+}
+
+void App::StopFrameTimer()
+{
+    if (frameTimerArmed_) {
+        frameTimerArmed_ = false;
+        if (frameTimer_)
+            CancelWaitableTimer(frameTimer_);
+    }
 }
 
 void App::OnHousekeep()
@@ -316,59 +457,46 @@ void App::OnHousekeep()
     // Cheap periodic refresh: prunes closed windows, adopts new ones and
     // re-syncs anything the user moved without a MOVESIZEEND we caught.
     RefreshTracker();
+    backdrop_.EnsureAlive();
 }
 
 // ----------------------------------------------------------------- camera --
 
-void App::SetCamera(POINT camera)
+void App::SetCamera(const Camera& camera)
 {
-    if (camera.x == camera_.x && camera.y == camera_.y)
+    if (camera == cam_)
         return;
-    camera_ = camera;
-    tracker_.ApplyCamera(camera_);
+    cam_ = camera;
+    tracker_.ApplyCamera(cam_);
+    backdrop_.OnCameraChanged(cam_);
+    RecordFrame();
 }
 
-void App::FlyTo(POINT target)
+void App::FlyTo(const Camera& target)
 {
     if (mode_ == CamMode::Panning)
         return; // do not fight an active gesture
     overview_.Hide();
     RefreshTracker();
 
-    if (cfg_.flightMs <= 0 || (target.x == camera_.x && target.y == camera_.y)) {
+    if (cfg_.flightMs <= 0 || !frameTimer_ || target == cam_) {
         mode_ = CamMode::Idle;
-        StopTickTimer();
+        StopFrameTimer();
         SetCamera(target);
         return;
     }
 
     mode_ = CamMode::Flying;
-    flyFrom_ = camera_;
+    flyFrom_ = cam_;
     flyTo_ = target;
-    flyStart_ = GetTickCount64();
+    flyStartQpc_ = NowQpc();
     flyDuration_ = cfg_.flightMs;
-    StartTickTimer();
-}
-
-void App::StartTickTimer()
-{
-    if (!tickTimerOn_) {
-        SetTimer(hwnd_, IDT_TICK, 15, nullptr);
-        tickTimerOn_ = true;
-    }
-}
-
-void App::StopTickTimer()
-{
-    if (tickTimerOn_) {
-        KillTimer(hwnd_, IDT_TICK);
-        tickTimerOn_ = false;
-    }
+    StartFrameTimer();
 }
 
 void App::RefreshTracker()
 {
-    tracker_.Refresh(camera_);
+    tracker_.Refresh(cam_);
     dirty_ = false;
 
     if (tracker_.ElevatedSeen() && !elevatedNotified_) {
@@ -378,6 +506,54 @@ void App::RefreshTracker()
                       L"более высокими правами и не могут быть перемещены. Запустите "
                       L"InfiniteCanvas от имени администратора, чтобы управлять ими.");
     }
+}
+
+// ------------------------------------------------------------- fps stats --
+
+long long App::NowQpc() const
+{
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return counter.QuadPart;
+}
+
+double App::SecondsSince(long long qpc) const
+{
+    return (double)(NowQpc() - qpc) / qpcFreq_;
+}
+
+void App::RecordFrame()
+{
+    const long long now = NowQpc();
+    if (lastApplyQpc_) {
+        double gapMs = (double)(now - lastApplyQpc_) * 1000.0 / qpcFreq_;
+        if (gapMs < 250.0)
+            statFrameMs_ = gapMs;
+    }
+    lastApplyQpc_ = now;
+
+    if (!statWindowStartQpc_)
+        statWindowStartQpc_ = now;
+    ++statFrames_;
+    double windowSec = (double)(now - statWindowStartQpc_) / qpcFreq_;
+    if (windowSec >= 0.25) {
+        statFps_ = statFrames_ / windowSec;
+        statFrames_ = 0;
+        statWindowStartQpc_ = now;
+    }
+}
+
+FrameStats App::CurrentStats()
+{
+    FrameStats stats;
+    stats.scale = cam_.scale;
+    stats.windows = (int)tracker_.Windows().size();
+    // Report zero while the canvas is idle: an FPS number would be stale.
+    if (lastApplyQpc_ && SecondsSince(lastApplyQpc_) < 0.7) {
+        stats.fps = statFps_;
+        stats.frameMs = statFrameMs_;
+    }
+    return stats;
 }
 
 // ---------------------------------------------------------------- hotkeys --
@@ -393,7 +569,7 @@ void App::OnHotkey(int id)
     if (id >= HK_BM_SET_FIRST && id < HK_BM_SET_FIRST + 4) {
         int slot = id - HK_BM_SET_FIRST;
         cfg_.bookmarks[slot].set = true;
-        cfg_.bookmarks[slot].cam = camera_;
+        cfg_.bookmarks[slot].cam = cam_;
         cfg_.SaveBookmark(slot);
         tray_.Balloon(L"InfiniteCanvas", L"Закладка сохранена");
         return;
@@ -401,13 +577,16 @@ void App::OnHotkey(int id)
 
     switch (id) {
     case HK_HOME:
-        FlyTo(POINT{0, 0});
+        FlyTo(Camera{});
         break;
     case HK_OVERVIEW:
         ShowOverview();
         break;
     case HK_PAUSE:
         TogglePause();
+        break;
+    case HK_FPS:
+        fps_.Toggle();
         break;
     case HK_EXIT:
         DestroyWindow(hwnd_);
@@ -427,7 +606,7 @@ void App::OnTrayMessage(LPARAM event)
     case WM_CONTEXTMENU: {
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, IDM_OVERVIEW, L"Обзор холста\tCtrl+Alt+O");
-        AppendMenuW(menu, MF_STRING, IDM_HOME, L"Вернуться домой\tCtrl+Alt+Home");
+        AppendMenuW(menu, MF_STRING, IDM_HOME, L"Вернуться домой (100%)\tCtrl+Alt+Home");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (paused_ ? MF_CHECKED : 0), IDM_PAUSE, L"Пауза\tCtrl+Alt+P");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -457,7 +636,7 @@ void App::OnMenuCommand(int id)
         ShowOverview();
         break;
     case IDM_HOME:
-        FlyTo(POINT{0, 0});
+        FlyTo(Camera{});
         break;
     case IDM_PAUSE:
         TogglePause();
@@ -486,7 +665,7 @@ void App::ShowOverview()
     }
     if (mode_ == CamMode::Panning)
         return;
-    StopTickTimer();
+    StopFrameTimer();
     mode_ = CamMode::Idle;
     RefreshTracker();
 
@@ -496,20 +675,25 @@ void App::ShowOverview()
         OverviewItem item;
         item.hwnd = entry.hwnd;
         item.title = entry.title;
-        item.virt = RECT{entry.virt.x, entry.virt.y,
-                         entry.virt.x + entry.size.cx, entry.virt.y + entry.size.cy};
+        item.virt = RECT{(LONG)std::lround(entry.vx), (LONG)std::lround(entry.vy),
+                         (LONG)std::lround(entry.vx + entry.vw), (LONG)std::lround(entry.vy + entry.vh)};
         item.movable = entry.movable;
         items.push_back(std::move(item));
     }
 
+    // Current viewport in canvas coordinates (virtual = screen/scale + cam).
+    const double sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const double sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const double sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const double sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     RECT viewport{
-        GetSystemMetrics(SM_XVIRTUALSCREEN) + camera_.x,
-        GetSystemMetrics(SM_YVIRTUALSCREEN) + camera_.y,
-        GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + camera_.x,
-        GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) + camera_.y,
+        (LONG)std::lround(sx / cam_.scale + cam_.x),
+        (LONG)std::lround(sy / cam_.scale + cam_.y),
+        (LONG)std::lround((sx + sw) / cam_.scale + cam_.x),
+        (LONG)std::lround((sy + sh) / cam_.scale + cam_.y),
     };
 
-    overview_.Show(instance_, std::move(items), viewport, cfg_.overviewAlpha,
+    overview_.Show(instance_, std::move(items), viewport, cfg_.overviewAlpha, cam_.scale,
                    [this](HWND hwnd) { CenterOnWindow(hwnd); });
 }
 
@@ -527,10 +711,12 @@ void App::CenterOnWindow(HWND hwnd)
     const POINT center{(mi.rcWork.left + mi.rcWork.right) / 2,
                        (mi.rcWork.top + mi.rcWork.bottom) / 2};
 
-    FlyTo(POINT{
-        entry->virt.x + entry->size.cx / 2 - center.x,
-        entry->virt.y + entry->size.cy / 2 - center.y,
-    });
+    // Keep the current scale; the window's virtual center lands on the
+    // monitor's center: cam = vCenter - screenCenter / scale.
+    Camera target = cam_;
+    target.x = (entry->vx + entry->vw / 2.0) - center.x / cam_.scale;
+    target.y = (entry->vy + entry->vh / 2.0) - center.y / cam_.scale;
+    FlyTo(target);
 }
 
 void App::TogglePause()
@@ -542,17 +728,24 @@ void App::TogglePause()
 
 void App::ReloadConfig()
 {
-    // Unregister bookmark hotkeys first: EnableBookmarks may have changed.
+    // Unregister hotkeys first: EnableBookmarks may have changed.
     for (int i = 0; i < 4; ++i) {
         UnregisterHotKey(hwnd_, HK_BM_GO_FIRST + i);
         UnregisterHotKey(hwnd_, HK_BM_SET_FIRST + i);
     }
-    for (int id : {HK_HOME, HK_OVERVIEW, HK_PAUSE, HK_EXIT})
+    for (int id : {HK_HOME, HK_OVERVIEW, HK_PAUSE, HK_EXIT, HK_FPS})
         UnregisterHotKey(hwnd_, id);
 
     cfg_.Load();
     LogInit(ExeDir() + L"\\infinitecanvas.log", cfg_.logToFile);
+    framePeriod100ns_ = 10000000ll / std::max(30, std::min(240, cfg_.targetFps));
     RegisterHotkeys();
+
+    backdrop_.Destroy();
+    backdrop_.Create(instance_, &cfg_);
+    pan_.SetExtraBackground(backdrop_.Handle());
+    backdrop_.OnCameraChanged(cam_);
+
     RefreshTracker();
     tray_.Balloon(L"InfiniteCanvas", L"Конфиг перезагружен");
 }

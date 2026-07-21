@@ -7,7 +7,7 @@
 // Camera bookmark (Ctrl+Alt+Shift+1..4 to save, Ctrl+Alt+1..4 to jump).
 struct Bookmark {
     bool set = false;
-    POINT cam{0, 0};
+    Camera cam;
 };
 
 // Settings loaded from config.ini next to the executable.
@@ -15,10 +15,21 @@ struct Bookmark {
 class Config {
 public:
     // [Pan]
-    bool middleButton = true;
-    bool altLeftButton = true;
+    bool ctrlAltMiddle = true;  // primary: Ctrl+Alt + middle drag, anywhere
+    bool middleButton = true;   // legacy: middle drag on the desktop background
+    bool altLeftButton = true;  // legacy: Alt+LMB drag on the desktop background
     double sensitivity = 1.0;
     int dragThresholdPx = 4;
+
+    // [Zoom]
+    bool zoomEnabled = true;
+    bool captureWheel = true;   // swallow Ctrl+Alt+wheel globally
+    double zoomStep = 1.1;      // scale multiplier per wheel notch
+    double zoomMin = 0.25;
+    double zoomMax = 2.5;
+
+    // [Render]
+    int targetFps = 240;        // animation loop target, clamped to [30, 240]
 
     // [Inertia]
     bool inertiaEnabled = true;
@@ -40,10 +51,18 @@ public:
     bool overviewEnabled = true;
     int overviewAlpha = 235;
 
+    // [Backdrop]
+    bool backdropEnabled = true;
+    COLORREF backdropColor = RGB(0x14, 0x16, 0x1C);
+    COLORREF backdropGridColor = RGB(0x2A, 0x2E, 0x3A);
+    int backdropGridStep = 96; // virtual pixels between grid dots
+    bool backdropShowGrid = true;
+
     // [Hotkeys]
     bool enableBookmarks = true;
 
     // [Debug]
+    bool showFps = false;
     bool logToFile = false;
 
     Bookmark bookmarks[4];
@@ -62,5 +81,6 @@ private:
     bool ReadBool(const wchar_t* section, const wchar_t* key, bool def) const;
     int ReadInt(const wchar_t* section, const wchar_t* key, int def) const;
     double ReadDouble(const wchar_t* section, const wchar_t* key, double def) const;
+    COLORREF ReadColor(const wchar_t* section, const wchar_t* key, COLORREF def) const;
     std::vector<std::wstring> ReadList(const wchar_t* section, const wchar_t* key, const wchar_t* def) const;
 };

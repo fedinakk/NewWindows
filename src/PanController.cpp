@@ -26,6 +26,11 @@ void PanController::Shutdown()
     s_instance = nullptr;
 }
 
+bool PanController::CtrlAltDown()
+{
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000);
+}
+
 LRESULT CALLBACK PanController::MouseProc(int code, WPARAM wparam, LPARAM lparam)
 {
     if (code == HC_ACTION && s_instance) {
@@ -45,17 +50,36 @@ bool PanController::Handle(WPARAM message, const MSLLHOOKSTRUCT* info)
     const POINT pt = info->pt;
 
     switch (message) {
-    case WM_MBUTTONDOWN:
-        if (!cfg_->middleButton)
+    case WM_MOUSEWHEEL:
+        // Ctrl+Alt+wheel belongs to the canvas globally: it must never reach
+        // the focused application (so no browser Ctrl+wheel zoom etc.).
+        if (!cfg_->zoomEnabled || !cfg_->captureWheel)
             return false;
-        return TryStart(pt, Button::Middle);
+        if (!CtrlAltDown())
+            return false;
+        wheelAccum_ += (short)HIWORD(info->mouseData);
+        wheelPt_ = pt;
+        if (!zoomPending_) {
+            zoomPending_ = true;
+            PostMessageW(notify_, WM_APP_ZOOM, 0, 0);
+        }
+        return true;
+
+    case WM_MBUTTONDOWN:
+        // Primary gesture: Ctrl+Alt + middle drag pans from anywhere, even
+        // over a focused application window.
+        if (cfg_->ctrlAltMiddle && CtrlAltDown())
+            return TryStart(pt, Button::CtrlAltMiddle, false);
+        if (cfg_->middleButton)
+            return TryStart(pt, Button::Middle, true);
+        return false;
 
     case WM_LBUTTONDOWN:
         if (!cfg_->altLeftButton)
             return false;
         if (!(GetAsyncKeyState(VK_MENU) & 0x8000))
             return false;
-        return TryStart(pt, Button::AltLeft);
+        return TryStart(pt, Button::AltLeft, true);
 
     case WM_MOUSEMOVE:
         if (state_ == State::Idle)
@@ -79,7 +103,7 @@ bool PanController::Handle(WPARAM message, const MSLLHOOKSTRUCT* info)
         return false; // never swallow moves
 
     case WM_MBUTTONUP:
-        if (button_ != Button::Middle)
+        if (button_ != Button::Middle && button_ != Button::CtrlAltMiddle)
             return false;
         return Finish(pt);
 
@@ -92,7 +116,7 @@ bool PanController::Handle(WPARAM message, const MSLLHOOKSTRUCT* info)
     return false;
 }
 
-bool PanController::TryStart(POINT pt, Button button)
+bool PanController::TryStart(POINT pt, Button button, bool requireBackground)
 {
     if (state_ != State::Idle) {
         // Recover from a missed button-up (the OS may skip a slow LL hook).
@@ -101,7 +125,7 @@ bool PanController::TryStart(POINT pt, Button button)
         state_ = State::Idle;
     }
 
-    if (!IsBackgroundAt(pt))
+    if (requireBackground && !IsBackgroundAt(pt))
         return false;
 
     state_ = State::Pending;
@@ -111,8 +135,8 @@ bool PanController::TryStart(POINT pt, Button button)
     updatePending_ = false;
     sampleCount_ = 0;
     AddSample(pt);
-    // Swallow the button-down: a click on the empty desktop has no meaning,
-    // and passing it through would start a marquee selection.
+    // Swallow the button-down: with Ctrl+Alt it must not reach the focused
+    // app; on the empty desktop it would only start a marquee selection.
     return true;
 }
 
@@ -143,6 +167,8 @@ bool PanController::IsBackgroundAt(POINT pt) const
         root = hwnd;
     if (root == GetDesktopWindow())
         return true;
+    if (extraBackground_ && (hwnd == extraBackground_ || root == extraBackground_))
+        return true;
 
     wchar_t cls[128] = L"";
     GetClassNameW(root, cls, 128);
@@ -158,12 +184,19 @@ POINT PanController::ConsumeLatest()
     return latest_;
 }
 
+void PanController::ConsumeZoom(int& wheelDelta, POINT& pt)
+{
+    wheelDelta = wheelAccum_;
+    pt = wheelPt_;
+    wheelAccum_ = 0;
+    zoomPending_ = false;
+}
+
 void PanController::AddSample(POINT pt)
 {
     if (sampleCount_ < kMaxSamples) {
         samples_[sampleCount_++] = Sample{pt, GetTickCount64()};
     } else {
-        // Ring: shift is wasteful; overwrite oldest by rotating index 0 out.
         memmove(samples_, samples_ + 1, sizeof(Sample) * (kMaxSamples - 1));
         samples_[kMaxSamples - 1] = Sample{pt, GetTickCount64()};
     }
