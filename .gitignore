@@ -1,0 +1,11 @@
+# Visual Studio
+.vs/
+bin/
+obj/
+x64/
+*.user
+*.aps
+*.log
+
+# Local artifacts
+infinitecanvas.log
